@@ -917,14 +917,22 @@ apply_rules() {
     local gs_lan_args=()
     local private_ranges="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/8 fd00::/8 fe80::/10"
 
-    # IPs manuais, de sessão, de domínio e CIDRs do whitelist.conf → trusted (-t) do geoip-shell
+    # IPs trusted do whitelist.conf → trusted (-t) do geoip-shell
     local gs_trusted_args=()
     local trusted_ips=""
     if [[ -f "$WHITELIST_FILE" ]]; then
-        trusted_ips=$(grep -vE "^#|^$" "$WHITELIST_FILE" | grep -E "\|(manual|session|domain|cidr)\|" | cut -d'|' -f1 | tr '\n' ' ' | xargs) || true
+        if [[ "$gs_mode" == "blacklist" ]]; then
+            # Em blacklist, só manual e session (domínios/CIDRs são desnecessários)
+            trusted_ips=$(grep -vE "^#|^$" "$WHITELIST_FILE" | grep -E "\|(manual|session)\|" | cut -d'|' -f1 | tr '\n' ' ' | xargs) || true
+        else
+            # Em whitelist, todos os tipos exceto auto (que vão para -l)
+            trusted_ips=$(grep -vE "^#|^$" "$WHITELIST_FILE" | grep -E "\|(manual|session|domain|cidr)\|" | cut -d'|' -f1 | tr '\n' ' ' | xargs) || true
+        fi
     fi
 
     # Em blacklist, adicionar redes privadas à lista trusted (pois -l não é suportado)
+    # Não deduplica: as entradas 'auto' no whitelist.conf são apenas documentação;
+    # apply_rules() extrai só manual|session, então não há duplicata real
     if [[ "$gs_mode" == "blacklist" && "${ALLOW_PRIVATE:-yes}" == "yes" ]]; then
         trusted_ips="$private_ranges $trusted_ips"
     elif [[ "$gs_mode" == "whitelist" && "${ALLOW_PRIVATE:-yes}" == "yes" ]]; then
@@ -1088,7 +1096,12 @@ cmd_whitelist_add() {
     # Aplicar imediatamente via geoip-shell trusted (-t)
     if command -v geoip-shell &>/dev/null; then
         local trusted_ips
-        trusted_ips=$(grep -vE "^#|^$" "$WHITELIST_FILE" | grep -E "\|(manual|session|domain|cidr)\|" | cut -d'|' -f1 | tr '\n' ' ' | xargs) || true
+        load_config 2>/dev/null || true
+        if [[ "${MODE:-whitelist}" == "blacklist" ]]; then
+            trusted_ips=$(grep -vE "^#|^$" "$WHITELIST_FILE" | grep -E "\|(manual|session)\|" | cut -d'|' -f1 | tr '\n' ' ' | xargs) || true
+        else
+            trusted_ips=$(grep -vE "^#|^$" "$WHITELIST_FILE" | grep -E "\|(manual|session|domain|cidr)\|" | cut -d'|' -f1 | tr '\n' ' ' | xargs) || true
+        fi
         [[ -n "$trusted_ips" ]] && geoip-shell configure -z -t "$trusted_ips" &>/dev/null && info "Regra ativa imediatamente." || true
     fi
 
@@ -1117,7 +1130,12 @@ cmd_whitelist_remove() {
     # Atualizar trusted IPs no geoip-shell imediatamente
     if command -v geoip-shell &>/dev/null; then
         local trusted_ips
-        trusted_ips=$(grep -vE "^#|^$" "$WHITELIST_FILE" | grep -E "\|(manual|session|domain|cidr)\|" | cut -d'|' -f1 | tr '\n' ' ' | xargs) || true
+        load_config 2>/dev/null || true
+        if [[ "${MODE:-whitelist}" == "blacklist" ]]; then
+            trusted_ips=$(grep -vE "^#|^$" "$WHITELIST_FILE" | grep -E "\|(manual|session)\|" | cut -d'|' -f1 | tr '\n' ' ' | xargs) || true
+        else
+            trusted_ips=$(grep -vE "^#|^$" "$WHITELIST_FILE" | grep -E "\|(manual|session|domain|cidr)\|" | cut -d'|' -f1 | tr '\n' ' ' | xargs) || true
+        fi
         if [[ -n "$trusted_ips" ]]; then
             geoip-shell configure -z -t "$trusted_ips" &>/dev/null || true
         else
@@ -1163,7 +1181,7 @@ cmd_reload() {
 
 # ── FW STATUS (helper) ───────────────────────────────────
 fw_status_brief() {
-    if iptables -t mangle -L GEOIP-SHELL_IN -n 2>/dev/null | grep -q "DROP\|ACCEPT"; then
+    if iptables -t mangle -L GEOIP-SHELL_IN -n 2>/dev/null | grep "DROP\|ACCEPT" >/dev/null 2>&1; then
         echo "active"
     elif crontab -l 2>/dev/null | grep -q "geoip-shell-persistence"; then
         echo "paused"
@@ -2352,7 +2370,8 @@ show_current_summary() {
     fi
 
     # Detectar estado real do firewall
-    if iptables -t mangle -L GEOIP-SHELL_IN -n 2>/dev/null | grep -q "DROP\|ACCEPT"; then
+    # NOTA: não usar grep -q com pipe — causa SIGPIPE no iptables com set -euo pipefail
+    if iptables -t mangle -L GEOIP-SHELL_IN -n 2>/dev/null | grep "DROP\|ACCEPT" >/dev/null 2>&1; then
         echo -e "  ${GREEN}${BOLD}● GeoIP Firewall ATIVO${NC}"
     elif crontab -l 2>/dev/null | grep -q "geoip-shell-persistence"; then
         echo -e "  ${YELLOW}${BOLD}⚠ GeoIP Firewall PAUSADO — regras voltam no reboot${NC}"
@@ -2855,12 +2874,22 @@ menu_change_mode() {
     echo -e "  Países:   ${CYAN}$(echo "$saved_countries" | wc -w) países${NC}"
     echo -e "  Arquivo:  ${CYAN}$CONF_FILE${NC}"
 
-    # ── 2. Atualizar cron ──────────────────────────────────
+    # ── 2. Limpar whitelist se mudou para blacklist ─────────
+    if [[ "$new_mode" == "blacklist" && -f "$WHITELIST_FILE" ]]; then
+        local removed_count
+        removed_count=$(grep -cE '\|(domain|cidr)\|' "$WHITELIST_FILE" 2>/dev/null || echo 0)
+        if [[ "$removed_count" -gt 0 ]]; then
+            sed -i '/|domain|/d;/|cidr|/d' "$WHITELIST_FILE"
+            info "Removidas $removed_count entradas de domínios/CIDRs (desnecessárias em blacklist)."
+        fi
+    fi
+
+    # ── 3. Atualizar cron ──────────────────────────────────
     echo ""
     step "Atualizando cron..."
     setup_cron
 
-    # ── 3. Atualizar listas GeoIP ──────────────────────────
+    # ── 4. Atualizar listas GeoIP ──────────────────────────
     echo ""
     step "Atualizando listas GeoIP..."
     if command -v geoip-fw &>/dev/null; then
@@ -2869,7 +2898,7 @@ menu_change_mode() {
         warn "geoip-fw não encontrado. Execute manualmente: geoip-fw update"
     fi
 
-    # ── 4. Aplicar regras ──────────────────────────────────
+    # ── 5. Aplicar regras ──────────────────────────────────
     echo ""
     step "Aplicando regras do firewall..."
     if command -v geoip-fw &>/dev/null; then
@@ -2878,7 +2907,7 @@ menu_change_mode() {
         warn "geoip-fw não encontrado. Execute manualmente: geoip-fw reload"
     fi
 
-    # ── 5. Resumo final ───────────────────────────────────
+    # ── 6. Resumo final ───────────────────────────────────
     echo ""
     echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════${NC}"
     echo -e "${GREEN}${BOLD}   ✔ Modo alterado com sucesso!${NC}"
@@ -3035,8 +3064,9 @@ show_main_menu() {
         echo "  12) Remover tudo"
         echo ""
         # Opções de estado do firewall — label dinâmico
+        # NOTA: não usar grep -q com pipe — causa SIGPIPE no iptables com set -euo pipefail
         local _fw_st
-        if iptables -t mangle -L GEOIP-SHELL_IN -n 2>/dev/null | grep -q "DROP\|ACCEPT"; then
+        if iptables -t mangle -L GEOIP-SHELL_IN -n 2>/dev/null | grep "DROP\|ACCEPT" >/dev/null 2>&1; then
             _fw_st="active"
         elif crontab -l 2>/dev/null | grep -q "geoip-shell-persistence"; then
             _fw_st="paused"
@@ -3088,7 +3118,7 @@ show_main_menu() {
                 ;;
             13)
                 echo ""
-                if iptables -t mangle -L GEOIP-SHELL_IN -n 2>/dev/null | grep -q "DROP\|ACCEPT"; then
+                if iptables -t mangle -L GEOIP-SHELL_IN -n 2>/dev/null | grep "DROP\|ACCEPT" >/dev/null 2>&1; then
                     geoip-fw pause || true
                 else
                     geoip-fw enable || true

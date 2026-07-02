@@ -1,2 +1,35 @@
-# Claude Code - orientações internas
+# Claude Code
 CLAUDE.md
+
+# Logs
+*.log
+/var/log/
+
+# Configurações do sistema (geradas na instalação)
+/etc/geoip-firewall/
+/etc/geoip-shell/
+
+# Wrapper instalado
+/usr/local/bin/geoip-fw
+
+# GeoIP Shell (clonado)
+/opt/geoip-shell/
+
+# Dados do geoip-shell
+/var/lib/geoip-shell/
+
+# Temporários
+/tmp/geoip-*
+fetch_res/
+main_status/
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
