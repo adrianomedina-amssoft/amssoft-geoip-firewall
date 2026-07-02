@@ -1124,7 +1124,7 @@ cmd_whitelist_remove() {
         die "Não é possível remover entradas automáticas (RFC1918/loopback). Edite $WHITELIST_FILE manualmente se necessário."
     fi
 
-    sed -i "/^${ip_range}|/d" "$WHITELIST_FILE"
+    sed -i "\#^${ip_range}|#d" "$WHITELIST_FILE"
     info "Removido da whitelist: $ip_range"
 
     # Atualizar trusted IPs no geoip-shell imediatamente
